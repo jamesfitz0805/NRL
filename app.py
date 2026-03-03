@@ -6,6 +6,8 @@ from bs4 import BeautifulSoup
 from openai import OpenAI
 from datetime import datetime
 
+import pandas as pd
+
 # =========================
 # Constants / configuration
 # =========================
@@ -70,6 +72,26 @@ TEAM_SLUG = {
     "New Zealand Warriors": "warriors",
     "Wests Tigers": "wests-tigers",
 }
+POSITIONS = [
+    "Fullback",
+    "Winger",
+    "Centre",
+    "Five-eighth",
+    "Halfback",
+    "Prop",
+    "Hooker",
+    "Second Row",
+    "Lock",
+    "Interchange",
+    "Utility",
+]
+PLAYER_STATS_IDS = [
+    "33",  # tries
+    "35",  # goals
+    "45",  # tackles made
+    "47",  # run metres
+    "52",  # line breaks
+]
 SYSTEM_PROMPT = """
 You are an NRL tactical profiler.
 
@@ -92,6 +114,100 @@ def fetch_html(url: str) -> str:
     r = requests.get(url, headers=headers, timeout=25)
     r.raise_for_status()
     return r.text
+
+def _log(msg: str):
+    # Collect logs in session state so you can show them in an expander
+    st.session_state.setdefault("stats_scrape_logs", [])
+    st.session_state["stats_scrape_logs"].append(msg)
+
+def _unique_preserve_order(items: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for item in items:
+        clean = " ".join((item or "").split())
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        out.append(clean)
+    return out
+
+
+def _team_aliases(team_full: str) -> list[str]:
+    aliases = {team_full, TEAM_SHORT.get(team_full, team_full)}
+    for token in ["St", "St.", "Warringah", "-", "Bankstown"]:
+        aliases.update({a.replace(token, "").strip() for a in list(aliases)})
+    aliases = {a for a in aliases if a}
+    return sorted(aliases, key=len, reverse=True)
+
+
+def _row_matches_team(row_text: str, aliases: list[str]) -> bool:
+    row_text_lower = row_text.lower()
+    return any(alias.lower() in row_text_lower for alias in aliases)
+
+
+
+
+
+# pick a few stats pages to widen coverage
+PLAYER_STATS_IDS = ["76", "1000079", "1000026", "38"]  # points, handling errors, penalties, tries (examples)
+
+TEAM_SHORT = {
+    "Manly Warringah Sea Eagles": "Sea Eagles",
+    "Canberra Raiders": "Raiders",
+    # ... keep your existing mapping
+}
+
+@st.cache_data(ttl=86400)
+def get_players_from_stats(team_full: str, season: int) -> list[str]:
+    """
+    Robust approach:
+    - Fetch NRL stats player table pages (HTML)
+    - Parse tables with pandas.read_html
+    - Filter rows where the 'Club' column matches the team (via mapping)
+    """
+    target_tokens = {
+        team_full.lower(),
+        TEAM_SHORT.get(team_full, team_full).lower(),
+    }
+
+    names = set()
+
+    for stat_id in PLAYER_STATS_IDS:
+        url = f"https://www.nrl.com/stats/players/?competition=111&season={season}&stat={stat_id}"
+        try:
+            html = fetch_html(url)
+
+            # pandas will find HTML tables and convert to DataFrames
+            tables = pd.read_html(html)
+            if not tables:
+                continue
+
+            df = tables[0]
+            cols = {c.lower(): c for c in df.columns}
+
+            # Try to locate likely column names
+            player_col = cols.get("player")
+            club_col = cols.get("club") or cols.get("team")
+
+            if not player_col or not club_col:
+                # Table layout changed; skip this stat_id
+                continue
+
+            for _, row in df.iterrows():
+                club = str(row[club_col]).strip().lower()
+                player = str(row[player_col]).strip()
+
+                if not player or player.lower() == "nan":
+                    continue
+
+                # match against tokens (handles "Sea Eagles" vs full name)
+                if any(tok in club for tok in target_tokens):
+                    names.add(player)
+
+        except Exception:
+            continue
+
+    return sorted(names)
 
 
 # =========================
@@ -484,18 +600,59 @@ if "scraped_opponent_list" not in st.session_state:
     st.session_state["scraped_opponent_list"] = ""
 if "player_stats_text" not in st.session_state:
     st.session_state["player_stats_text"] = ""
+if "team_list_players_by_team" not in st.session_state:
+    st.session_state["team_list_players_by_team"] = {}
+if "selected_player_by_team" not in st.session_state:
+    st.session_state["selected_player_by_team"] = {}
+if "manual_player_override_by_team" not in st.session_state:
+    st.session_state["manual_player_override_by_team"] = {}
+if "include_broader_list" not in st.session_state:
+    st.session_state["include_broader_list"] = True
 
 # ---- Inputs ----
 st.subheader("1) Select team + player")
 
 colA, colB, colC = st.columns([1.2, 1.2, 1.0], gap="large")
 
+with st.expander("Debug: stats scrape logs"):
+    for line in st.session_state.get("stats_scrape_logs", [])[-200:]:
+        st.text(line)
+
+if st.button("Clear stats scrape logs"):
+    st.session_state["stats_scrape_logs"] = []
+
 with colA:
     team = st.selectbox("Your team", NRL_TEAMS, index=NRL_TEAMS.index("Manly Warringah Sea Eagles"))
 with colB:
-    player = st.text_input("Player", "Josh Feledy")
+    include_broader_list = st.toggle("Include broader list (best effort)", value=st.session_state["include_broader_list"])
+    st.session_state["include_broader_list"] = include_broader_list
+
+    current_season = datetime.now().year
+    team_list_players = st.session_state["team_list_players_by_team"].get(team, [])
+    broader_players = get_players_from_stats(team, current_season) if include_broader_list else []
+    player_options = _unique_preserve_order(team_list_players + broader_players)
+    if not player_options:
+        player_options = ["Josh Feledy"]
+
+    selected_player_by_team = st.session_state["selected_player_by_team"]
+    if team not in selected_player_by_team or selected_player_by_team[team] not in player_options:
+        selected_player_by_team[team] = player_options[0]
+
+    selected_player = st.selectbox(
+        "Player",
+        player_options,
+        index=player_options.index(selected_player_by_team[team]),
+    )
+    selected_player_by_team[team] = selected_player
+
+    manual_default = st.session_state["manual_player_override_by_team"].get(team, "")
+    manual_player_override = st.text_input("Or type player name", value=manual_default)
+    st.session_state["manual_player_override_by_team"][team] = manual_player_override
+
 with colC:
-    position = st.text_input("Position", "Centre")
+    position = st.selectbox("Position", POSITIONS, index=POSITIONS.index("Centre"))
+
+player = manual_player_override.strip() or selected_player
 
 # ---- Fixture: auto next opponent ----
 st.subheader("2) Next fixture (auto)")
@@ -613,7 +770,12 @@ with btn_col1:
                 st.info(data["note"])
 
             away_players = [p for p in data.get("players", []) if p.get("side") == "away"]
+            home_players = [p for p in data.get("players", []) if p.get("side") == "home"]
+
+            if home_players:
+                st.session_state["team_list_players_by_team"][team] = _unique_preserve_order([p["name"] for p in sorted(home_players, key=lambda p: p["number"])])
             if away_players:
+                st.session_state["team_list_players_by_team"][opponent] = _unique_preserve_order([p["name"] for p in sorted(away_players, key=lambda p: p["number"])])
                 bullets = "\n".join([f"- #{p['number']} {p['name']} ({p['position']})" for p in away_players])
                 st.session_state["scraped_opponent_list"] = bullets
                 st.success("Loaded opponent team list.")
