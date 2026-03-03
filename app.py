@@ -6,6 +6,8 @@ from bs4 import BeautifulSoup
 from openai import OpenAI
 from datetime import datetime
 
+import pandas as pd
+
 # =========================
 # Constants / configuration
 # =========================
@@ -113,6 +115,10 @@ def fetch_html(url: str) -> str:
     r.raise_for_status()
     return r.text
 
+def _log(msg: str):
+    # Collect logs in session state so you can show them in an expander
+    st.session_state.setdefault("stats_scrape_logs", [])
+    st.session_state["stats_scrape_logs"].append(msg)
 
 def _unique_preserve_order(items: list[str]) -> list[str]:
     seen = set()
@@ -139,50 +145,67 @@ def _row_matches_team(row_text: str, aliases: list[str]) -> bool:
     return any(alias.lower() in row_text_lower for alias in aliases)
 
 
+
+
+
+# pick a few stats pages to widen coverage
+PLAYER_STATS_IDS = ["76", "1000079", "1000026", "38"]  # points, handling errors, penalties, tries (examples)
+
+TEAM_SHORT = {
+    "Manly Warringah Sea Eagles": "Sea Eagles",
+    "Canberra Raiders": "Raiders",
+    # ... keep your existing mapping
+}
+
 @st.cache_data(ttl=86400)
 def get_players_from_stats(team_full: str, season: int) -> list[str]:
-    team_aliases = _team_aliases(team_full)
+    """
+    Robust approach:
+    - Fetch NRL stats player table pages (HTML)
+    - Parse tables with pandas.read_html
+    - Filter rows where the 'Club' column matches the team (via mapping)
+    """
+    target_tokens = {
+        team_full.lower(),
+        TEAM_SHORT.get(team_full, team_full).lower(),
+    }
+
     names = set()
 
     for stat_id in PLAYER_STATS_IDS:
         url = f"https://www.nrl.com/stats/players/?competition=111&season={season}&stat={stat_id}"
         try:
             html = fetch_html(url)
-            soup = BeautifulSoup(html, "lxml")
+
+            # pandas will find HTML tables and convert to DataFrames
+            tables = pd.read_html(html)
+            if not tables:
+                continue
+
+            df = tables[0]
+            cols = {c.lower(): c for c in df.columns}
+
+            # Try to locate likely column names
+            player_col = cols.get("player")
+            club_col = cols.get("club") or cols.get("team")
+
+            if not player_col or not club_col:
+                # Table layout changed; skip this stat_id
+                continue
+
+            for _, row in df.iterrows():
+                club = str(row[club_col]).strip().lower()
+                player = str(row[player_col]).strip()
+
+                if not player or player.lower() == "nan":
+                    continue
+
+                # match against tokens (handles "Sea Eagles" vs full name)
+                if any(tok in club for tok in target_tokens):
+                    names.add(player)
+
         except Exception:
             continue
-
-        for row in soup.select("table tbody tr"):
-            cells = [td.get_text(" ", strip=True) for td in row.select("td")]
-            if not cells:
-                continue
-
-            row_text = " | ".join(cells)
-            if not _row_matches_team(row_text, team_aliases):
-                continue
-
-            name = None
-            for a in row.select("a[href]"):
-                href = a.get("href", "")
-                candidate = " ".join(a.get_text(" ", strip=True).split())
-                if "/players/" in href and " " in candidate:
-                    name = candidate
-                    break
-
-            if not name:
-                for cell in cells:
-                    cleaned = " ".join(cell.split())
-                    if len(cleaned) < 4 or cleaned.isdigit():
-                        continue
-                    if _row_matches_team(cleaned, team_aliases):
-                        continue
-                    if not re.search(r"[A-Za-z].*\s+[A-Za-z]", cleaned):
-                        continue
-                    name = cleaned
-                    break
-
-            if name:
-                names.add(name)
 
     return sorted(names)
 
@@ -590,6 +613,13 @@ if "include_broader_list" not in st.session_state:
 st.subheader("1) Select team + player")
 
 colA, colB, colC = st.columns([1.2, 1.2, 1.0], gap="large")
+
+with st.expander("Debug: stats scrape logs"):
+    for line in st.session_state.get("stats_scrape_logs", [])[-200:]:
+        st.text(line)
+
+if st.button("Clear stats scrape logs"):
+    st.session_state["stats_scrape_logs"] = []
 
 with colA:
     team = st.selectbox("Your team", NRL_TEAMS, index=NRL_TEAMS.index("Manly Warringah Sea Eagles"))
